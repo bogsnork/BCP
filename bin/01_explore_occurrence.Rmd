@@ -1,0 +1,474 @@
+---
+title: 'Batlinks: occurence data from NBN'
+output:
+  html_document: default
+  html_notebook: default
+  word_document: default
+params:
+  path.occ:
+    label: "Path to occurrence data:"
+    value: "data/observations/Chiroptera_NBN_since1990"
+  fn.occ:
+    label: "File name: include file extension (e.g. .csv).  Leave blank if you are reading in a whole folder of files."
+    value: "Chriroptera_NBN_since1990.csv"
+  sel.taxon.level:
+    label: "Select minimum taxon level"
+    value: "species"
+    input: select
+    choices: [species, genus, family, suborder, order, unranked]
+  sel.coord.uncert:
+    label: "Select maximum coordiante uncertainty (metres)"
+    value: "1000"
+    input: select
+    choices: [1, 10, 50, 100, 1000, 5000, 10000]
+  sel.min.occ:
+    label: "Select minimum number of records per species"
+    value: "1"
+---
+   
+
+```{r setup, include=FALSE}
+#document setup
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE, echo=FALSE)
+```
+
+
+
+```{r, include=FALSE}
+#packages-----
+library(skimr)
+library(knitr)
+library(kableExtra)
+library(sp)
+library(rgdal)
+library(tidyverse)
+library(rnrfa)
+```
+
+
+```{r}
+#variables
+
+#occurrence data to import
+#path to raw occurrence data
+path.occ <- paste0("../", params$path.occ)  
+
+#filename raw occurrence data
+fn.occ <- params$fn.occ
+
+#data selection criteria
+sel.taxon.level <- params$sel.taxon.level #taxon level
+
+#create list of taxon levels
+#species, genus, family, suborder, order, unranked
+taxa <- c("species", "genus", "family", "suborder", "order", "unranked")
+sel.taxon.level <- taxa[1:match(params$sel.taxon.level, taxa)] #creates vector of taxon level and below. 
+
+sel.coord.uncert <- params$sel.coord.uncert #coordinate uncertainty in metres
+sel.min.occ <- params$sel.min.occ #minimum number of occurrences per taxon
+
+```
+
+
+```{r}
+#functions
+
+#table formatting for output
+format_table <- function(table){
+  knitr::kable(table, caption = table_caption) %>% 
+  kableExtra::kable_styling(bootstrap_options = "striped", 
+                            full_width = F, 
+                            position = "left")
+}
+```
+
+This document summarises bat occurence data for the Batlinks area that is available publically on NBN Atlas.
+
+
+```{r}
+#load data
+
+#read single occurrence file
+# occ_NBN_raw <- read_csv(paste0(path.occ, fn.occ))
+# occ_NBN <- occ_NBN_raw
+
+#read folder of occurrence files (all in same format)
+#speciesdf <- map_df(list.files(path = path.occ, full.names = TRUE), read_csv)
+#read single occurrence file
+speciesdf <- read_csv(file = paste0(path.occ, "/", fn.occ))
+names(speciesdf)
+head(speciesdf)
+```
+
+
+```{r}
+#remove duplicates
+paste("Raw data has ", nrow(speciesdf), "records")
+speciesdf <- distinct(speciesdf) 
+paste("After removal of duplicates there are now ", nrow(speciesdf), "records.")
+
+#Prepare the data for analysis by adding eastings and northings
+#code adapted from github.com/jncc/sdms
+
+## Data from the NBNatlas Inital clean to give presence records in GB, also subset records by bngCol as varying precisions for Grid References
+speciesdf$OSGR <- toupper(speciesdf$OSGR)
+speciesdf <- speciesdf[speciesdf$`Occurrence status` == "present",]  # remove absence data
+#speciesdf <- speciesdf[!speciesdf$`State/Province` == "Northern Ireland",]  # subset to GB only
+speciesdf <- speciesdf[grepl("[[:alnum:]]", speciesdf[["OSGR"]]),]  #select rows with gridref records
+names(speciesdf)[names(speciesdf) == "Year"] <- "year"
+speciesdf$precision <- NA  #add precision
+
+# ensure grid references are consistent
+speciesdf$precision <-
+  ifelse(grepl("^[a-zA-Z]{2}[0-9]{4}$", speciesdf[["OSGR"]]), '1km', 'NA')
+  speciesdf$precision[grepl("^[a-zA-Z]{2}[0-9]{2}[a-zA-Z]{1}$", speciesdf[["OSGR"]])] <-
+  '2km'
+  speciesdf$precision[grepl("^[a-zA-Z]{2}[0-9]{2}$", speciesdf[["OSGR"]])] <-
+  '10km'
+  speciesdf$precision[grepl("^[a-zA-Z]{2}$", speciesdf[["OSGR"]])] <-
+  '100km'
+  speciesdf$precision[grepl("^[a-zA-Z]{2}[0-9]{6}$", speciesdf[["OSGR"]])] <-
+  '100m'
+
+    # Check precision column is numerical, and convert to m
+    if (!is.numeric(speciesdf[["precision"]])) {
+        speciesdf$res <- sub("[^[:alpha:]]+", "", speciesdf[["precision"]])
+        speciesdf[["precision"]] <- as.numeric(gsub("([0-9]+).*$", "\\1",
+            speciesdf[["precision"]]))
+        speciesdf[["precision"]] <- ifelse(speciesdf$res == "m", speciesdf[["precision"]],
+            speciesdf[["precision"]] * 1000)
+        speciesdf$res <- NULL
+    }  
+  
+  
+paste(nrow(speciesdf), "occurrences after subsetting")  
+```
+
+
+```{r}
+#create easting and northing columns
+speciesdf$easting<-NA
+speciesdf$northing<-NA
+
+# Split between normal grid refs and 'tetrad' (2km) grids
+nontetrad <- speciesdf[which(!speciesdf[["precision"]] == 2000),]
+tetrad <- speciesdf[which(speciesdf[["precision"]] == 2000),]
+
+nontetrad[c("easting", "northing")] <- nontetrad$OSGR %>% 
+      purrr::map(
+        purrr::possibly(osg_parse, 
+                        otherwise = list(easting= NA, northing = NA), 
+                        quiet = T)
+      ) %>% 
+  do.call(rbind.data.frame,.)
+
+select(nontetrad, OSGR, easting, northing)
+```
+
+
+```{r}
+#this loop fails with incorrect grid refs, so use purrr function above
+# if (nrow(nontetrad) > 0) {
+#   for (i in 1:nrow(nontetrad)) {
+#     ne <- rnrfa::osg_parse(nontetrad$OSGR[i])
+#     nontetrad$easting[i] <- ne[[1]]
+#     nontetrad$northing[i] <- ne[[2]]
+#   }
+# }
+
+speciesdf <- nontetrad
+
+    # Calculate tetrad grids seperately
+    if (nrow(tetrad) > 0) {
+        tetrad$At10kcorner <- paste(stringi::stri_sub(tetrad[[bngCol]],
+            1, 4))
+        tetrad$Letter <- paste(stringi::stri_sub(tetrad[[bngCol]], 5,
+            -1))
+        for (i in 1:nrow(tetrad)) {
+            ne <- rnrfa::osg_parse(tetrad$At10kcorner[i])
+            tetrad$easting[i] <- ne[[1]]
+            tetrad$northing[i] <- ne[[2]]
+        }
+        Tetrad <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+            "K", "L", "M", "N", "P", "Q", "R", "S", "T", "U", "V", "W",
+            "X", "Y", "Z")
+        AddEast <- c(1000, 1000, 1000, 1000, 1000, 3000, 3000, 3000, 3000,
+            3000, 5000, 5000, 5000, 5000, 5000, 7000, 7000, 7000, 7000,
+            7000, 9000, 9000, 9000, 9000, 9000)
+        AddNorth <- c(1000, 3000, 5000, 7000, 9000, 1000, 3000, 5000,
+            7000, 9000, 1000, 3000, 5000, 7000, 9000, 1000, 3000, 5000,
+            7000, 9000, 1000, 3000, 5000, 7000, 9000)
+        AddTetrad <- data.frame(Tetrad, AddEast, AddNorth)
+        tetrad <- merge(tetrad, AddTetrad, by.x = "Letter", by.y = "Tetrad",
+            all.x = T)
+        tetrad$easting <- tetrad$easting + tetrad$AddEast
+        tetrad$northing <- tetrad$northing + tetrad$AddNorth
+        tetrad$At10kcorner <- tetrad$AddEast <- tetrad$AddNorth <- tetrad$Letter <- NULL
+        colnames(tetrad)[1] <- colnames(nontetrad)[1]
+        speciesdf <- rbind(nontetrad, tetrad)
+
+    }  
+
+#write to a clean object
+occ_NBN <- speciesdf
+```
+
+
+```{r}
+#summarise and save to object
+summary_occ_NBN <- skim(occ_NBN)
+
+#store parsing problems
+probs_occ_NBN <- problems(occ_NBN)
+
+#select actual values from problem cells
+probs_occ_NBN <- cbind(probs_occ_NBN, value = occ_NBN[probs_occ_NBN$row, unique(probs_occ_NBN$col)])  
+```
+## Data 
+
+```{r}
+table_caption <- "Parsing problems"
+probs_occ_NBN[-5] %>% 
+  format_table()
+```
+
+
+
+```{r}
+##Prepare data
+
+#select variables
+#names(occ_NBN)
+#occ_NBN <- occ_NBN_raw
+occ_NBN <- occ_NBN %>% 
+  select(
+    # TCI = `Taxon Concept ID`,
+    TCI = `Species ID (TVK)`,
+    # taxon_rank = `Taxon rank`,
+    spp_name = `Scientific name`,
+    # order = Order,
+    # genus = Genus,
+    # species = Species,
+    #datum = `Geodetic Datum`,
+    gridref = `OSGR`,
+    lat = `Latitude (WGS84)`, 
+    lon = `Longitude (WGS84)`,
+    easting = easting, 
+    northing = northing,
+    coord_uncert = precision,
+    date = `Start date`
+    #year = year#,
+    #month = Month
+    ) 
+
+#Make the occurrence data spatial
+#count(occ_NBN, datum)
+
+#remove records without location
+occ_NBN <- filter(occ_NBN, !is.na(lon))
+
+occ_NBN_coords <- select(occ_NBN, lon, lat)
+  
+occ_NBN_sp <- SpatialPointsDataFrame(coords = occ_NBN_coords, data = occ_NBN,
+                                     proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+#have a look at the projections
+#proj4string(occ_NBN_sp); proj4string(bound); proj4string(bbox)
+
+#transform projection to match polygons
+occ_NBN_sp <- spTransform(occ_NBN_sp, CRSobj = CRS(proj4string(bound)))
+#plot(occ_NBN_sp)
+```
+
+```{r}
+#plot boundaries and points
+# sp::plot(bound, main = "Project boundary and location of records")
+# #plot(bbox)#, add = T)
+# points(occ_NBN_sp, add=T)
+
+ggplot() +  
+  geom_point(data = occ_NBN_sp %>% 
+               coordinates() %>% 
+               data.frame() %>% 
+               mutate(species = occ_NBN_sp$spp_name), 
+             aes(x=lon, y=lat, colour = species)) +
+  geom_polygon(data = bound, aes(x=long, y=lat), 
+               fill = "green", colour = "black", alpha = 0.01) +
+  labs(title = "Project boundary and location of records", 
+       x = "easting", 
+       y = "northing") 
+```
+
+```{r}
+#select points within boundary 
+occ_NBN_sp <- occ_NBN_sp[bound,]
+plot(occ_NBN_sp)
+```
+
+```{r}
+#write selected data back to a dataframe
+occ_NBN <- occ_NBN_sp@data
+```
+
+
+
+```{r}
+#Sample of data (random selection of rows)
+table_caption <- "Sample of data (random selection of rows)"
+occ_NBN %>% 
+  sample_n(20) %>% 
+  format_table()
+```
+
+## Taxa
+
+
+```{r}
+table_caption <- "Count of species"
+occ_NBN %>% 
+  count(spp_name, sort = T) %>% 
+  format_table()
+```
+
+
+Consider location uncertainty. 
+
+```{r}
+table_caption <- "Coordinate uncertainty in metres"
+graphdata <- occ_NBN %>% 
+  select(spp_name, coord_uncert) %>% 
+    mutate(species = as.factor(spp_name)) 
+
+for(i in unique(graphdata$species)){
+print(ggplot(filter(graphdata, species == i), aes( x = coord_uncert)) +
+  geom_bar() +
+  scale_x_log10()+
+    labs(title = i)) 
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+occ_table <- occ_NBN %>% 
+  filter(spp_name != is.na(spp_name) ) %>% 
+  select(spp_name, coord_uncert) %>%
+  mutate(species = as.factor(spp_name)) %>% 
+  mutate(coord_uncert = as.factor(coord_uncert)) %>% 
+  group_by(species) %>% 
+  count(coord_uncert) %>% 
+  spread(key = coord_uncert, value = n)
+
+occ_table
+
+write.csv(occ_table, "../data/occ_table.csv", row.names = F)
+
+
+# 
+#  group_by(species) %>% 
+#   count(species, sort = T) %>% 
+#   summarise_if
+```
+
+
+coordinate uncertainty by species
+```{r}
+table_caption <- "Coordinate uncertainty in metres by species"
+occ_NBN %>% 
+  group_by(spp_name) %>% 
+count(coord_uncert) %>% 
+  format_table()
+```
+
+## Select data for further analysis
+
+Select records that are: 
+
+* identified to `r params$sel.taxon.level` level
+* coordinate uncertainty no greater than `r sel.coord.uncert`m
+* at least `r sel.min.occ` records per species 
+
+**This isn't working properly except for taxon level species.  I think that's because I am selecting at different taxon levels, but then filtering by the column `species`.  Should instead use `scientific name interpreted`. **
+
+```{r}
+occ_sel <- occ_NBN %>% 
+  filter(
+   coord_uncert <= sel.coord.uncert
+         ) 
+
+sppcount <- occ_sel %>% 
+  count(spp_name) %>% 
+  filter(n >= sel.min.occ) 
+
+occ_sel <- occ_sel %>% 
+  filter(spp_name %in% sppcount$spp_name)
+
+#tabulate changes
+table_caption <- "Number of records following selection"
+full_join(x = count(occ_sel, spp_name), 
+          y = count(occ_NBN, spp_name), 
+          by = "spp_name", 
+          suffix = c(".sel", ".orig")) %>% 
+  mutate(diff = n.sel - n.orig) %>% 
+  format_table()
+```
+
+
+
+
+```{r}
+#Make the occurrence data spatial
+
+occ_sel_coords <- select(occ_sel, lon, lat)
+  
+occ_sel_sp <- SpatialPointsDataFrame(coords = occ_sel_coords, data = occ_sel, proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+#have a look at the projections
+#proj4string(occ_sel_sp); proj4string(bound); proj4string(bbox)
+
+#transform projection to match polygons
+occ_sel_sp <- spTransform(occ_sel_sp, CRSobj = CRS(proj4string(bound)))
+#plot(occ_sel_sp)
+
+#sp::plot(bound, main = "Project boundary and location of records")
+#plot(bbox)#, add = T)
+#points(occ_sel_sp, add=T)
+```
+
+
+```{r}
+#prepare data for ggplot plotting
+ggplot() +  
+  geom_polygon(data = bound, aes(x=long, y=lat), 
+               fill = "white", colour = "black", alpha = 0.01) +
+  geom_point(data = occ_sel_sp %>% 
+               coordinates() %>% 
+               data.frame() %>% 
+               mutate(spp_name = occ_sel_sp$spp_name), 
+             aes(x=lon, y=lat, colour = spp_name)) +
+  labs(title = "Project boundary and location of records", 
+       x = "easting", 
+       y = "northing")
+
+```
+
+```{r}
+table_caption <- "Number of records by species"
+count(occ_sel, spp_name) %>% 
+  format_table()
+```
+
+
+```{r}
+#prepare output for maxent
+occ_maxent <- select(occ_sel, spp_name, easting, northing)
+```
+
+
+## Export data
+```{r, echo=TRUE}
+write_csv(speciesdf, "../data/observations/prepped/occurrence_NBN_raw.csv")
+write_csv(occ_NBN, "../data/observations/prepped/occurrence_NBN_fltrd.csv")
+write_csv(occ_sel, "../data/observations/occurrence_NBN_slctd.csv")
+write_csv(occ_maxent, "../data/observations/occurrence_maxent.csv")
+
+```
+

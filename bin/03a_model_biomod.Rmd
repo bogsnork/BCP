@@ -1,0 +1,346 @@
+---
+title: "Bat Distribution Modelling with Biomod2"
+output: html_notebook
+---
+##Packages
+```{r}
+# load packages
+library(Hmisc)
+library(car)
+library(raster)
+library(randomForest)
+library(rgdal)
+library(biomod2)
+library(data.table)
+
+library(tidyverse)
+```
+
+##Helper functions
+
+```{r}
+#helper functions
+'%not in%' <- function(x, table) is.na(match(x, table, nomatch=NA_integer_))
+
+# ++++++++++++++++++++++++++++
+# flattenCorrMatrix
+# ++++++++++++++++++++++++++++
+# cormat : matrix of the correlation coefficients
+# pmat : matrix of the correlation p-values
+#courtesy of http://www.sthda.com/english/wiki/correlation-matrix-a-quick-start-guide-to-analyze-format-and-visualize-a-correlation-matrix-using-r-software
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+```
+
+
+##Import, prepare and select training data
+
+```{r}
+# import prepared data
+obs_vars_training <- read.csv("../data/training/observations_variables_NBN.csv", header = T)
+head(obs_vars_training)
+```
+
+```{r}
+#clean 
+obs_vars_training <- obs_vars_training %>% 
+  mutate(date = parse_date(date)) %>% 
+  mutate(year = lubridate::year(date)) %>% 
+  mutate(month = lubridate::month(date)) %>% 
+  mutate(genus = stringr::word(spp_name)) %>% 
+  filter(complete.cases(.)) %>% 
+  select(TCI, genus, spp_name, gridref, lat, lon, easting, northing, coord_uncert, date, year, month, everything())
+
+head(select(obs_vars_training, genus, spp_name, date, year, month))
+names(obs_vars_training)
+```
+
+
+```{r}
+#filter observations
+obs_vars_training %>% group_by(spp_name) %>% count()
+
+obs_vars_training_flt <- obs_vars_training %>% 
+  filter(year >= 1990) %>% 
+  filter(coord_uncert <= 100) %>% 
+  filter(spp_name %not in% c("Chiroptera", "Vespertilionidae", "Rhinolophus", 
+                             "Rhinolophidae"))
+
+obs_vars_training_flt %>% group_by(spp_name) %>% count()
+obs_vars_training_flt %>% group_by(genus) %>% count()
+```
+
+##Select species to model
+```{r}
+species <- "Myotis nattereri"
+
+obs_vars_selected <- obs_vars_training_flt %>% 
+  filter(spp_name == species) %>% 
+  droplevels()
+```
+
+
+
+##Split observations from training data
+
+```{r}
+observations <- select(obs_vars_selected, TCI:month) 
+predictors <- select(obs_vars_selected, (ncol(observations)+1):ncol(obs_vars_training_flt))
+```
+
+## Make predictor metadata
+
+Create a metatata table with groupings for predictors including: 
+
+- feature
+- type
+- focal radius 
+
+```{r}
+#split predictor names into separate columns 
+predictor_meta <- data.frame(name = names(predictors), 
+                               str_split(names(predictors), pattern = "_", simplify = T)) 
+
+#first column is normally the feature name, but not always so needs some manual corrections
+predictor_meta$feature <- predictor_meta$X1
+predictor_meta[predictor_meta$X1 == "distance", "feature"] <- predictor_meta[predictor_meta$X1 == "distance", "X2"]  
+
+predictor_meta <- predictor_meta %>% 
+  mutate(feature = replace(x = as.character(feature),
+                           list = str_detect(string = name, pattern = "dtm"),
+                           "terrain"))  %>%
+  mutate(feature = replace(x = as.character(feature),
+                        list = str_detect(string = name, pattern = "LCM"),
+                        "habitats")) %>% 
+  mutate(feature = as.factor(feature)) %>% 
+  droplevels()
+
+#create type column - in most cases this is the last word in the name string
+predictor_meta$type <-
+  str_replace_all(names(predictors), pattern = "_", replacement = " ") %>% #splits
+  word(start = -1) #picks the last word
+
+#deal with anomalies
+predictor_meta <- predictor_meta %>% 
+  mutate(type = replace(x = type,
+                        list = str_detect(string = name, pattern = "distance"),
+                        "distance"))  %>%
+  mutate(type = replace(x = type, 
+                        list = str_detect(string = type, pattern = "dtmaspectcat"),
+                        "aspect")) %>%
+  mutate(type = replace(x = type,
+                        list = str_detect(string = type, pattern = "50"),
+                        "elevation")) %>%
+  mutate(type = replace(x = type, 
+                        list = str_detect(string = type, pattern = "habitats"),
+                        "diversity")) %>%
+  mutate(type = replace(x = type, 
+                        list = str_detect(string = type, pattern = "dtmaspect"),
+                        "aspect"))
+select(predictor_meta, name, feature, type) #%>% filter(type %not in% c("cover", "linedensity"))                        
+predictor_meta$focal_radius <- predictor_meta$X4
+  
+predictor_meta <- predictor_meta %>% 
+  mutate(focal_radius = str_extract(names(training), pattern = "[:digit:]+")) %>% 
+  mutate(focal_radius = replace(x = focal_radius, 
+                        list = str_detect(string = focal_radius, pattern = "50$"),
+                        NA))
+unique(predictor_meta$focal_radius)
+
+#create metadata table
+predictor_meta <- predictor_meta %>% 
+  select(name, feature, type, focal_radius) %>% 
+  mutate_at(.vars = vars(name, feature, type), funs(as.factor(.))) %>% 
+  mutate(focal_radius = as.numeric(focal_radius)) %>% 
+  droplevels() 
+
+write.csv(predictor_meta, "../data/training/predictor_metadata.csv")
+predictor_meta
+```
+
+
+## Predictor correlation
+```{r}
+variable_selection <- 
+  predictor_meta %>% 
+# filter(focal_radius == 1000 | is.na(focal_radius)) %>% 
+  mutate(name = as.character(name)) %>% 
+  pull(name) #converts to vector
+
+
+predictor_correlation <- 
+  predictors %>%
+  select(variable_selection) %>% 
+  droplevels() %>% 
+  as.matrix() %>% 
+  rcorr(type="pearson") 
+
+#write_csv(as.data.frame(predictor_correlation$r), "../data/predictor_correlation_all.csv")
+predictor_correlation <- flattenCorrMatrix(cormat = predictor_correlation$r, pmat = predictor_correlation$P)
+#The general consensus (but it is highly debated) is that r>0.7 (or < -0.7 for a negative correlation) is high correlation and care should be taken if you include two variables which are correlated about that value I'd aim for <0.5 really
+
+predictor_correlation %>% 
+  filter(cor > 0.5)
+```
+
+Sam noticed lots of correlation where the focal radius is 1000m or above.  Lets have a look: 
+
+```{r}
+variable_selection <- 
+  predictor_meta %>% 
+ filter(focal_radius >= 1000 | is.na(focal_radius)) %>% 
+  mutate(name = as.character(name)) %>% 
+  pull(name) #converts to vector
+
+
+predictor_correlation <- 
+  predictors %>%
+  select(variable_selection) %>% 
+  droplevels() %>% 
+  as.matrix() %>% 
+  rcorr(type="pearson") 
+
+#write_csv(as.data.frame(predictor_correlation$r), "../data/predictor_correlation_all.csv")
+predictor_correlation <- flattenCorrMatrix(cormat = predictor_correlation$r, pmat = predictor_correlation$P)
+
+predictor_correlation %>% 
+  filter(cor > 0.8) 
+```
+
+```{r}
+variable_selection <- 
+  predictor_meta %>% 
+ filter(focal_radius < 1000 | is.na(focal_radius)) %>% 
+  mutate(name = as.character(name)) %>% 
+  pull(name) #converts to vector
+
+
+predictor_correlation <- 
+  predictors %>%
+  select(variable_selection) %>% 
+  droplevels() %>% 
+  as.matrix() %>% 
+  rcorr(type="pearson") 
+
+#write_csv(as.data.frame(predictor_correlation$r), "../data/predictor_correlation_all.csv")
+predictor_correlation <- flattenCorrMatrix(cormat = predictor_correlation$r, pmat = predictor_correlation$P)
+
+predictor_correlation %>% 
+  filter(cor > 0.8) 
+```
+
+
+See what the relationship is between correlation and focal radius
+
+```{r}
+variable_selection <- 
+  predictor_meta %>% 
+# filter(focal_radius == 1000 | is.na(focal_radius)) %>% 
+  mutate(name = as.character(name)) %>% 
+  pull(name) #converts to vector
+
+
+predictor_correlation <- 
+  predictors %>%
+  select(variable_selection) %>% 
+  droplevels() %>% 
+  as.matrix() %>% 
+  rcorr(type="pearson") 
+
+#write_csv(as.data.frame(predictor_correlation$r), "../data/predictor_correlation_all.csv")
+predictor_correlation <- flattenCorrMatrix(cormat = predictor_correlation$r, pmat = predictor_correlation$P)
+#The general consensus (but it is highly debated) is that r>0.7 (or < -0.7 for a negative correlation) is high correlation and care should be taken if you include two variables which are correlated about that value I'd aim for <0.5 really
+```
+
+```{r}
+
+graphdata <- 
+  as.data.frame(predictor_correlation) %>% 
+  mutate(focal_row = as.numeric(str_extract(row, "\\d+"))) %>% 
+  mutate(focal_col = as.numeric(str_extract(column, "\\d+")))
+
+graphdata$focal_ratio = graphdata$focal_col/graphdata$focal_row
+graphdata$focal_diff = graphdata$focal_col - graphdata$focal_row
+
+
+ggplot(graphdata, aes(x = cor, y = as.numeric(focal_col)))+
+  geom_point() +
+  facet_wrap(~focal_row)
+
+ggplot(graphdata, aes(x = cor, y = abs(focal_diff)))+
+  geom_point() 
+```
+
+
+
+## Prepare model parameters
+
+```{r}
+###BIOMOD Psuedo absence version###
+###We don't have any "true" absences so we'll use pseudo absences
+###These are randomly assigned absences (see below) 
+###Biomod allows the use of absences, pseudo-absences, or both
+
+#First we set up a name used for the folder
+exten<-"_firstrun"
+project.name<-paste0(str_replace_all(species, " ", "_"),exten)
+#the unique name is the name for the whole model
+uniname<-paste0(str_replace_all(species, " ", "_"),exten)
+uniname_post<-gsub("_", ".", uniname)
+#are there any categorical variables (soil type for example)
+cat.variables<-T
+```
+
+
+```{r}
+
+sp.records <- observations
+    
+# #First there is some set up to do
+#     
+#     #Set the coordinates of the presence (and absence if used) records 
+#     myRespXY<-coordinates(sp.records)
+#     ##Sometimes coordinates does something a little strange and pulls in the presence absence column
+#     ##Remove the presence absence column if necessary...
+#     if(ncol(myRespXY)>2){myRespXY<-myRespXY[,2:3]}#xy for presence
+#     
+#     #this is the response variable - all are 1 (present) for this example but 
+#     #it could be 1 or 0 (absent)
+#     myResp<-sp.records$PresAbs #Now using presence absence data that we have 
+#     
+    #copy the predictor variables so that we can start again if needed
+myExpl<-predictors
+  
+```
+
+##Choose predictors
+```{r}
+# Choose predictors ----
+
+    #now we want to drop some of the variables - we need to think about cor, cov, vif
+predictor_correlation %>% 
+  filter(cor > 0.5)
+
+names(myExpl)
+    
+#Based on the predictors 
+#Which variables do you want in the model
+#Think carefully about distance to urban areas - think about where the 
+#data is coming from for this session (is it a randomised sampling methodology?)
+keepLayers<-c(1:108)
+allVariables<-1:ncol(predictors)
+removeLayers<-which(allVariables %not in% keepLayers)
+#dropLayer removes rasters from the stack of predictor variables
+#those that remain will be the predictor
+myExpl<-myExpl[keepLayers] ##\drop climatic pond_distance250 (the first one) roads, rivers, etc
+names(myExpl)
+    
+```
+
