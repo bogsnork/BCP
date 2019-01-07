@@ -2,6 +2,15 @@
 title: "Bat Distribution Modelling with Biomod2"
 output: html_notebook
 ---
+
+##Parameters
+```{r}
+validation<-F
+pseudo_absence<-T
+log.dist<-F
+```
+
+
 ##Packages
 ```{r}
 # load packages
@@ -62,7 +71,9 @@ head(select(obs_vars_training, genus, spp_name, date, year, month))
 names(obs_vars_training)
 ```
 
+##Prepare observations
 
+###Filter observations
 ```{r}
 #filter observations
 obs_vars_training %>% group_by(spp_name) %>% count()
@@ -77,7 +88,7 @@ obs_vars_training_flt %>% group_by(spp_name) %>% count()
 obs_vars_training_flt %>% group_by(genus) %>% count()
 ```
 
-##Select species to model
+###Select species to model
 ```{r}
 species <- "Myotis nattereri"
 
@@ -88,14 +99,17 @@ obs_vars_selected <- obs_vars_training_flt %>%
 
 
 
-##Split observations from training data
+###Split observations from training data
 
 ```{r}
 observations <- select(obs_vars_selected, TCI:month) 
 predictors <- select(obs_vars_selected, (ncol(observations)+1):ncol(obs_vars_training_flt))
 ```
 
-## Make predictor metadata
+
+##Prepare predictors
+
+### Make predictor metadata
 
 Create a metatata table with groupings for predictors including: 
 
@@ -103,7 +117,9 @@ Create a metatata table with groupings for predictors including:
 - type
 - focal radius 
 
-```{r}
+```{r eval=FALSE, include=FALSE}
+#run only once, after that load from csv in next code block
+
 #split predictor names into separate columns 
 predictor_meta <- data.frame(name = names(predictors), 
                                str_split(names(predictors), pattern = "_", simplify = T)) 
@@ -161,12 +177,19 @@ predictor_meta <- predictor_meta %>%
   mutate(focal_radius = as.numeric(focal_radius)) %>% 
   droplevels() 
 
-write.csv(predictor_meta, "../data/training/predictor_metadata.csv")
+write.csv(predictor_meta, "../data/training/predictor_metadata.csv", row.names = F)
+```
+
+```{r}
+#read predictor metadata from csv
+predictor_meta <- read_csv("../data/training/predictor_metadata.csv")
 predictor_meta
 ```
 
 
-## Predictor correlation
+
+
+### Predictor correlation
 ```{r}
 variable_selection <- 
   predictor_meta %>% 
@@ -301,32 +324,31 @@ cat.variables<-T
 
 ```{r}
 
-sp.records <- observations
+#First there is some set up to do
+
+#add presence absence column to observations-  1 (present) or 0 (absent)
+observations$PresAbs <- rep("1", nrow(myRespXY))
     
-# #First there is some set up to do
-#     
-#     #Set the coordinates of the presence (and absence if used) records 
-#     myRespXY<-coordinates(sp.records)
-#     ##Sometimes coordinates does something a little strange and pulls in the presence absence column
-#     ##Remove the presence absence column if necessary...
-#     if(ncol(myRespXY)>2){myRespXY<-myRespXY[,2:3]}#xy for presence
-#     
-#     #this is the response variable - all are 1 (present) for this example but 
-#     #it could be 1 or 0 (absent)
-#     myResp<-sp.records$PresAbs #Now using presence absence data that we have 
-#     
-    #copy the predictor variables so that we can start again if needed
-myExpl<-predictors
+#Set the coordinates of the presence (and absence if used) records 
+myRespXY<- select(observations, easting, northing)
+
+
+# #if response variable has been defined, then paste it in here 
+myResp<-data.frame(observations$PresAbs) 
+
+
+#copy the predictor variables so that we can start again if needed
+myExpl <-stack("../data/predictors/var_stack.grd")
   
 ```
 
-##Choose predictors
+###Choose predictors
 ```{r}
 # Choose predictors ----
 
     #now we want to drop some of the variables - we need to think about cor, cov, vif
-predictor_correlation %>% 
-  filter(cor > 0.5)
+# predictor_correlation %>% 
+#   filter(cor > 0.5)
 
 names(myExpl)
     
@@ -336,11 +358,749 @@ names(myExpl)
 #data is coming from for this session (is it a randomised sampling methodology?)
 keepLayers<-c(1:108)
 allVariables<-1:ncol(predictors)
-removeLayers<-which(allVariables %not in% keepLayers)
+#removeLayers<-which(allVariables %not in% keepLayers)
+removeLayers<-  "dtmaspectcat"
 #dropLayer removes rasters from the stack of predictor variables
 #those that remain will be the predictor
-myExpl<-myExpl[keepLayers] ##\drop climatic pond_distance250 (the first one) roads, rivers, etc
+myExpl<-dropLayer(myExpl,removeLayers) 
 names(myExpl)
-    
 ```
+
+
+```{r}
+  ##Check if there categorical variables (e.g. soil type) as these have to be set as "factor" 
+    if(cat.variables)
+    {
+      factors.to.convert<-which(names(myExpl)=="dtmaspectcat")
+      for(j in factors.to.convert)
+      {
+        myExpl[[j]]<-as.factor(myExpl[[j]])
+      }
+    }
+    #myExpl<-raster::dropLayer(myExpl,c(4,6))
+    is.factor(myExpl)
+```
+
+###Prepare BIOMOD input
+
+```{r}
+#The following sends all the data to be formatted in the biomod format to be passed main biomod functions.  
+
+# Create pseudo absences ----
+        
+#We're only using pseudo absence data rather than presence absence
+    if(pseudo_absence){
+      suffix<-"_Full_PA1"
+      
+#Pass the predictor and response variables but also describe how the pseudo absences are created
+#this can be done at random, disc, or sre
+# - random is - well random
+# - disc places a buffer around each presence point (buffer is related to the resolution you are working at)
+# - sre uses an SRE (basic environmental model) to model presence and places absences outside that at random (seems an odd method to me)
+#The number of pseudo absences is a debatable topic - open journal articles are available (10,000 suggested for GLM, GAM, MaxEnt)
+      myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
+                                           expl.var = myExpl,
+                                           resp.xy = myRespXY,
+                                           resp.name = uniname,
+                                           PA.nb.rep = 1,
+                                           #PA.nb.absences = 10000,#
+                                           PA.nb.absences =floor(NROW(myResp)*2),
+                                           #1.5 times the number of presence records
+                                           PA.strategy = 'random',
+                                           #PA.strategy = 'disk',
+                                           PA.dist.min=500
+      )
+    } else {
+      #method if true absences are being used
+      suffix<-"_Full_AllData"
+      myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
+                                           expl.var = myExpl,
+                                           resp.xy = myRespXY,
+                                           resp.name = uniname#,
+                                           #eval.resp.xy = as.data.frame(evalRespXY),
+                                           #eval.resp.var = as.numeric(gcn.validation[,1]),
+                                           #eval.expl.var = myExpl,
+                                           #PA.nb.rep = 1,#change up for big server
+                                           #PA.nb.absences = 1000,#length(myResp)*1.5,
+                                           #PA.strategy = 'disk',
+                                           #PA.dist.min=250
+      )
+    }
+```
+
+
+```{r}
+  #  myBiomodData
+  #  plot(myBiomodData)
+```
+
+
+###Set model options
+Each of the model types (GLM, GAM, etc) have options that can - and should - be set if required.  Below I've given examples - but please ask if, for example, you start getting extremely good AUC scoresn.b. MaxEnt requires the installation of ... Maxent biomod support two versions of MaxEnt - I always use the Philips original version
+```{r}
+# Set model options -----
+myBiomodOption <- BIOMOD_ModelingOptions(
+  RF = list(maxnodes=25),
+  GAM = list( algo = 'GAM_mgcv',
+              type = 's_smoother',
+              k = 4,
+              interaction.level = 0,
+              myFormula = NULL,
+              family = binomial(link = 'logit'),
+              method = 'GCV.Cp',
+              optimizer = c('outer','newton'),
+              select = FALSE,
+              knots = NULL,
+              paraPen = NULL,
+              control = list(
+                nthreads = 1, irls.reg = 0, epsilon = 1e-07
+                , maxit = 200, trace = FALSE
+                , mgcv.tol = 1e-07, mgcv.half = 15
+                , rank.tol = 1.49011611938477e-08
+                , nlm = list(ndigit=7, gradtol=1e-06, stepmax=2, 
+                steptol=1e-04, iterlim=200, check.analyticals=0)
+                , optim = list(factr=1e+07)
+                , newton = list(conv.tol=1e-06, maxNstep=5, maxSstep=2
+                , maxHalf=30, use.svd=0), outerPIsteps = 0
+                , idLinksBases = TRUE, scalePenalty = TRUE, keepData = FALSE) )
+  #, CTA = list(control = rpart.control(cp=0.005))
+  #, MAXENT.Phillips = list( path_to_maxent.jar = "F:/APPS/MAXENT/", memory_allocated = 4096)
+)
+
+# Set the models you want to use ----
+
+#Here I have set the models that are usually pretty quick to run
+models.to.proc = c('GLM', 'GAM')
+#models.to.proc = c('GAM','FDA','GLM','RF','CTA','ANN','MARS','GBM','MAXENT.Phillips')
+```
+
+
+##Run the models
+
+The datasplit is an important value in here.  75 (below) says that 75% of the data will be used to create (train) the model, the remain 25 is the used to evaulate the predictions based on that model VarImport = related to the way that biomod calculates the variable importance
+This is a variable randomisation method
+
+```{r}
+# Run the models ----
+myBiomodModelOut <- BIOMOD_Modeling(
+  data = myBiomodData,
+  models = models.to.proc,
+  models.options = myBiomodOption,
+  NbRunEval = 1,
+  DataSplit = 75,
+  Yweights = NULL,
+  VarImport = 5,
+  models.eval.meth = c('ROC', 'TSS'),
+  #models.eval.meth = c('ROC','TSS','FAR','KAPPA','SR','ACCURACY','BIAS','POD','CSI','ETS'),
+  SaveObj = TRUE,
+  rescal.all.models = TRUE
+)
+```
+
+```{r}
+ myBiomodModelOut
+    # get all models evaluation
+    myBiomodModelEval <- get_evaluations(myBiomodModelOut)
+    # print the dimnames of this array
+    dimnames(myBiomodModelEval)
+```
+
+##Evaluate models
+```{r}
+#evaluate models ----
+
+#performance scores for each model option
+myBiomodModelEval[,"Testing.data",,,]
+
+myBiomodModelEval["ROC","Sensitivity",,"Full",] #ablity to predict presences
+
+myBiomodModelEval["ROC","Specificity",,"Full",] #ability to predict absences
+
+#myBiomodModelEval["ROC",,,,]
+#[x,,,,] x= ROC or TSS
+#[,x,,,] x= Testing.Data, Cutoff, Sensitivity, Specificity
+#[,,x,,] x= GAM, FDA, etc
+#[,,,x,] x= RUN1, RUN2, etc., Full
+```
+
+###Variable importance
+
+```{r}
+#variable importance ----
+
+#getModelsVarImport(myBiomodModelOut)
+#Let's see which variables are most important in the models
+variable_important<-get_variables_importance(myBiomodModelOut)
+#print(variable_important)
+variable_important
+str(variable_important)
+variable_important <- data.frame(variable_important[,,"Full",])
+
+```
+
+###Graph variable response
+
+It's a good idea to look at how each variable responsed.  For example, what range of annual precipitation or temperature does the species like?  Not to0 cold, not too hot...  The below creates a graph for each predictor variable.  Look at the GLM or GAm plots as these tend to be more understandable. Think about whether what you are seeing makes ecological sense based on your understanding of the species
+
+
+```{r}
+selected_feature <- c("ancientwoodland", "surfacewater", "woodedge", "woodland", "broadleavedorcoppice", "conifer", "mixedornewwoods", "population", "building", "road", "woodpasture", "habitats", "terrain")
+selected_models <- "GLM"
+
+
+proj_dir<-paste0(getwd(),"/BIOMOD2_plots/")
+if (!file.exists(proj_dir))
+{
+  dir.create(file.path(proj_dir))
+}
+
+
+mod.plot<-BIOMOD_LoadModels(myBiomodModelOut, models=selected_models)
+
+selected_variables <- predictor_meta %>% 
+  filter(feature %in% selected_feature) %>% 
+  filter(name %in% get_formal_data(obj = myBiomodModelOut, 'expl.var.names'))
+
+#implement response plot in ggplot2 thanks to http://rpubs.com/dgeorges/423715
+
+# get 2D response plots data
+rp.dat <- 
+response.plot2(
+  models = mod.plot,
+  Data = get_formal_data(myBiomodModelOut, 'expl.var'),
+  show.variables = selected_variables$name,
+  data.species = get_formal_data(myBiomodModelOut,'resp.var'),
+  do.bivariate = F, 
+  fixed.var.metric = "median",
+  col = c("blue", "red"),
+  legend=FALSE, 
+  plot = FALSE
+  ) 
+
+#extract into a dataframe
+resp.plot.dat <- 
+  bind_rows(lapply(rp.dat, function(dat_){
+    dat_$id <- rownames(dat_)
+    expl.dat_ <- dat_ %>% select(1, id) %>% gather("expl.name", "expl.val", 1)
+    pred.dat_ <- dat_ %>% select(-1, id) %>% gather("pred.name", "pred.val", -id)
+    out.dat_ <- full_join(expl.dat_, pred.dat_) 
+    return(out.dat_)
+  })) %>% 
+  mutate(
+    species = pred.name %>% strsplit('_') %>%  sapply(function(x) x[1]) %>% stringr::str_remove(gsub("_", ".", exten)),
+    pa.dat = pred.name %>% strsplit('_') %>% sapply(function(x) x[2]),
+    cv.rep = pred.name %>% strsplit('_') %>% sapply(function(x) x[3]),
+    model = pred.name %>% strsplit('_') %>% sapply(function(x) x[4])
+  ) %>% 
+  left_join(y = selected_variables, by = c("expl.name" = "name")) %>% 
+  identity()
+
+variable_important<-get_variables_importance(myBiomodModelOut)
+
+varImp_RUN1 <- data.frame(variable_important[,,"RUN1",]) %>% rownames_to_column(var = "name") %>% mutate(labelPos = 0.25)
+varImp_Full <- data.frame(variable_important[,,"Full",]) %>% rownames_to_column(var = "name") %>% mutate(labelPos = 0.35)
+
+variable_important <- 
+  bind_rows(RUN1 = varImp_RUN1, Full = varImp_Full, .id = "cv.rep") %>% 
+  full_join(y = selected_variables, by = "name") %>% 
+  identity()
+variable_important
+```
+
+
+
+
+```{r}
+#plot response plots with ggplot2
+for(i in unique(selected_variables$feature)){
+gg <- ggplot(filter(resp.plot.dat, feature == i), aes(x = expl.val, y = pred.val, col = cv.rep)) +
+  geom_line() +
+ 
+    geom_text(data = filter(variable_important, feature == i), 
+            aes(label = paste(cv.rep, "=", GLM), 
+                x = 0, y = labelPos, alpha = GLM), #colour = "black", 
+            hjust = "left", vjust = "center", size = 3, fontface = "bold") +
+   geom_text(data = filter(variable_important, feature == i), 
+            aes(label = paste(cv.rep, "=", GLM), 
+                x = 0, y = labelPos), 
+            hjust = "left", vjust = "center", size = 3) +
+  facet_wrap(~ focal_radius, scales = 'free_x')+
+  labs(title = paste("Response plots for", species), 
+       subtitle = paste(i, "by focal radius, (text shows variable importance for each run)"))+
+  theme(legend.position = "none")
+print(gg)
+ggsave(paste0(proj_dir,project.name,"_",i,"_var_plot_2.png"))
+}
+```
+
+##Review and Select variables
+
+Visual inspection of response plots and comparison with variable importance scores.  
+
+Visual inspection of response plots and comparison with variable importance scores.  
+
+For Myotis natteri: 
+
+- *ancient woodland*: highest var.imp. (4000m) didn't show much response.  Second highest (2000m) showed a plausible response curve.  
+-* surface water*: all of the surface water cover variables had a var.imp. score of 0.  All rejected.  However, distance to surface water scored 0.022 for the full model and was therefore selected.  However, response was low, so perhaps review.  
+- *woodland edge*: distance to woodland edge response is minimal, however linedensity of woodland edge shows a response from about 0.02.  
+- *woodland*: realised that I'd included two measures of woodland cover, one from NIWT and one from OS Vectormap, and calculated response curves and var.imp. for them together.   That's quite misleading, and results in weird graphs.  However, it does look like the variables with smaller focal radius perform badly until about 2000m, so that focal radius selected.  Will try OS Vectormap as variable.  Also, distance to woodland performs as expected (responds at about 2000m) so will be included.   
+- *broadleaved or coppice*: highest scoring var.imp is at 2000m and responds appropriately. 
+- *conifer*: all bar 200m scored 0.  200m responded appropriately at about 50% cover
+- *mixed or new woods*: neither of the highest scoring responded.  decided to leave this out. 
+- *population*: the highest scoring var.imp. were from 4000m, where it showed decline from about 75% which is certainly the shape I was expecting.  I wonder if this is robust, but it's an interesting one to include so I'll pop it in.  I suspect it's highly correlated to buildings so will review later.  
+- *building cover*: so that's quite weird.  Not all show a response (including the one with the highest var.imp.), but those that do show a positive response, which is not what I expected.  Choosing 300m as second best var.imp. with a positive response from about 50%.  
+- *road*: another odd one.  Best var.imp. was at 6000m and showed negative response.  Second best was 300m which showed positive response.  Really dont' know what to do about that.  Maybe put them both in for the time being.  
+- *woodpasture and parkland*: interestingly best var.imp was at 2000m and second best at 300m.  Will select 300m as patches likely small.  
+- *habitat diversity*: minimal response and 0 var.imp but I'll keep it in for the time being because it's unique.  
+- *terrain*: again I mistakenly lumped all the terrain variables together.  Also had to remove the categorical version of the aspect variable because models failed.  Will keep all the non-cat variables in for the time being.  
+```{r}
+predictor_meta %>% filter(feature == "terrain")
+
+variables_for_model <- c(
+  ancientwoodland = "ancientwoodland_all_2000_cover", 
+  surfacewater = "distance_surfacewater",
+  woodedge = "woodedge_100_linedensity", 
+  woodland_cover = "woodland_2000_cover",
+  woodland_distance = "distance_woodland", 
+  broadleavedorcoppice = "broadleavedorcoppice_2000_cover", 
+  conifer = "conifer_200_cover", 
+  population = "population_dens_6000_cover",
+  building = "building_300_cover",
+  road_pos = "road_300_linedensity",
+  road_neg = "road_6000_linedensity", 
+  woodpasture = "woodpasture_parkland_300_cover",
+  habitats = "LCM_shannon_habitats",
+  aspect = "dtmaspect", 
+  elevation = "dtm_os_terrain_50",
+  slope = "dtmslope_degree")
+variables_for_model
+
+
+
+```
+
+
+#Run model with selected predictors
+
+
+
+
+## Prepare model parameters
+
+```{r}
+###BIOMOD Psuedo absence version###
+#First we set up a name used for the folder
+exten<-"_thirdrun"
+project.name<-paste0(str_replace_all(species, " ", "_"),exten)
+#the unique name is the name for the whole model
+uniname<-paste0(str_replace_all(species, " ", "_"),exten)
+uniname_post<-gsub("_", ".", uniname)
+#are there any categorical variables (soil type for example)
+cat.variables<-F
+```
+
+
+```{r}
+#First there is some set up to do
+#Set the coordinates of the presence (and absence if used) records 
+myRespXY<- select(observations, easting, northing)
+
+#add presence absence column to observations-  1 (present) or 0 (absent)
+observations$PresAbs <- rep("1", nrow(myRespXY))
+
+# #if response variable has been defined, then paste it in here 
+myResp<-data.frame(observations$PresAbs) 
+
+
+#copy the predictor variables so that we can start again if needed
+myExpl <-stack("../data/predictors/var_stack.grd")
+  
+```
+
+
+
+
+### Predictor correlation
+```{r}
+variable_selection <- variables_for_model
+names(variable_selection) <- variables_for_model
+predictor_correlation <- 
+  predictors %>%
+  select(variable_selection) %>%
+  droplevels() %>% 
+  as.matrix() %>% 
+  rcorr(type="pearson") 
+
+#write_csv(as.data.frame(predictor_correlation$r), "../data/predictor_correlation_all.csv")
+predictor_correlation <- flattenCorrMatrix(cormat = predictor_correlation$r, pmat = predictor_correlation$P)
+#The general consensus (but it is highly debated) is that r>0.7 (or < -0.7 for a negative correlation) is high correlation and care should be taken if you include two variables which are correlated about that value I'd aim for <0.5 really
+plot(predictor_correlation$p, predictor_correlation$cor); abline(v = 0.05, col = "red"); abline(h = 0.5, col = "blue"); abline(h = -0.5, col = "blue"); abline(h = 0.7, col = "green"); abline(h = -0.7, col = "green")
+predictor_correlation %>% 
+  filter(cor > 0.5 | cor < -0.5) %>% 
+  arrange(desc(abs(cor)))
+```
+Looking at the graph, there is lots of statistically significant correlation (p <0.05, left of red line), but only 14 of these are highly correlated (outside of the blue lines). 
+
+```{r}
+#try with package corrr
+library(tidyverse)
+library(corrr)
+library(igraph)
+library(ggraph)
+
+variable_selection <- variables_for_model
+names(variable_selection) <- variables_for_model
+
+# Create a tidy data frame of correlations
+tidy_cors <- 
+  predictors %>%
+  select(variable_selection) %>%
+  droplevels() %>% 
+  as.matrix() %>% 
+  corrr::correlate() %>% 
+  corrr::stretch()
+
+# Convert correlations stronger than some value to an undirected graph object
+corr_threshold <- 0.5  #between 0 and 1
+graph_cors <- tidy_cors %>% 
+  filter(abs(r) > corr_threshold) %>% 
+  igraph::graph_from_data_frame(directed = FALSE)
+
+# Plot
+ggraph(graph_cors, layout = "star") +
+  geom_edge_link(aes(edge_alpha = 0.5, edge_width = abs(r), color = r)) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  scale_edge_colour_gradientn(limits = c(-1, 1), colors = c("firebrick2", "dodgerblue2")) +
+  geom_node_point(color = "yellow", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_graph() +
+  labs(title = "Correlations between predictors") 
+
+# try again removing highly correlated predictors
+# Convert correlations stronger than some value to an undirected graph object
+corr_threshold <- 0.5  #between 0 and 1
+graph_cors <- tidy_cors %>% 
+  filter(abs(r) > corr_threshold) %>% 
+  filter(x %not in% c("distance_surfacewater", "population_dens_6000_cover",
+                      "ancientwoodland_all_2000_cover")) %>% 
+  filter(y %not in% c("distance_surfacewater", "population_dens_6000_cover",
+                      "ancientwoodland_all_2000_cover")) %>% 
+  igraph::graph_from_data_frame(directed = FALSE)
+
+# Plot
+ggraph(graph_cors, layout = "star") +
+  geom_edge_link(aes(edge_alpha = 0.5, edge_width = abs(r), color = r)) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  scale_edge_colour_gradientn(limits = c(-1, 1), colors = c("firebrick2", "dodgerblue2")) +
+  geom_node_point(color = "yellow", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_graph() +
+  labs(title = "Correlations between selected predictors") 
+
+
+```
+
+```{r}
+predictors %>%
+  select(variable_selection) %>%
+  droplevels() %>% 
+  as.matrix() %>% 
+  corrr::correlate() %>% 
+  corrr::rplot() 
+
+
+```
+
+
+
+###Choose predictors
+
+```{r}
+#copy the predictor variables so that we can start again if needed
+myExpl <-stack("../data/predictors/var_stack.grd")
+# Choose predictors 
+variables_for_model <- c(
+  "woodedge_100_linedensity", 
+  "woodland_2000_cover",
+  "distance_woodland", 
+  "broadleavedorcoppice_2000_cover", 
+  "conifer_200_cover", 
+  "building_300_cover",
+  "road_300_linedensity",
+#  "road_6000_linedensity", 
+  "woodpasture_parkland_300_cover",
+  "LCM_shannon_habitats",
+#  "dtmaspect", 
+  "dtm_os_terrain_50",
+  "dtmslope_degree")
+variables_for_model
+
+keepLayers<- variables_for_model
+allVariables<-names(predictors)
+removeLayers<-which(allVariables %not in% keepLayers)
+myExpl<-dropLayer(myExpl,removeLayers) 
+names(myExpl)
+```
+
+
+```{r}
+  ##Check if there categorical variables (e.g. soil type) as these have to be set as "factor" 
+    if(cat.variables)
+    {
+      factors.to.convert<-which(names(myExpl)=="dtmaspectcat")
+      for(j in factors.to.convert)
+      {
+        myExpl[[j]]<-as.factor(myExpl[[j]])
+      }
+    }
+    #myExpl<-raster::dropLayer(myExpl,c(4,6))
+    is.factor(myExpl)
+```
+
+###Prepare BIOMOD input
+
+```{r}
+#The following sends all the data to be formatted in the biomod format to be passed main biomod functions.  
+
+# Create pseudo absences ----
+        
+#We're only using pseudo absence data rather than presence absence
+    if(pseudo_absence){
+      suffix<-"_Full_PA1"
+      
+#Pass the predictor and response variables but also describe how the pseudo absences are created
+#this can be done at random, disc, or sre
+# - random is - well random
+# - disc places a buffer around each presence point (buffer is related to the resolution you are working at)
+# - sre uses an SRE (basic environmental model) to model presence and places absences outside that at random (seems an odd method to me)
+#The number of pseudo absences is a debatable topic - open journal articles are available (10,000 suggested for GLM, GAM, MaxEnt)
+      myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
+                                           expl.var = myExpl,
+                                           resp.xy = myRespXY,
+                                           resp.name = uniname,
+                                           PA.nb.rep = 1,
+                                           #PA.nb.absences = 10000,#
+                                           PA.nb.absences =floor(NROW(myResp)*2),
+                                           #1.5 times the number of presence records
+                                           PA.strategy = 'random',
+                                           #PA.strategy = 'disk',
+                                           PA.dist.min=500
+      )
+    } else {
+      #method if true absences are being used
+      suffix<-"_Full_AllData"
+      myBiomodData <- BIOMOD_FormatingData(resp.var = myResp,
+                                           expl.var = myExpl,
+                                           resp.xy = myRespXY,
+                                           resp.name = uniname#,
+                                           #eval.resp.xy = as.data.frame(evalRespXY),
+                                           #eval.resp.var = as.numeric(gcn.validation[,1]),
+                                           #eval.expl.var = myExpl,
+                                           #PA.nb.rep = 1,#change up for big server
+                                           #PA.nb.absences = 1000,#length(myResp)*1.5,
+                                           #PA.strategy = 'disk',
+                                           #PA.dist.min=250
+      )
+    }
+```
+
+
+```{r}
+    myBiomodData
+    plot(myBiomodData)
+```
+
+
+###Set model options
+Each of the model types (GLM, GAM, etc) have options that can - and should - be set if required.  Below I've given examples - but please ask if, for example, you start getting extremely good AUC scoresn.b. MaxEnt requires the installation of ... Maxent biomod support two versions of MaxEnt - I always use the Philips original version
+```{r}
+# Set model options -----
+myBiomodOption <- BIOMOD_ModelingOptions(
+  RF = list(maxnodes=25),
+  GAM = list( algo = 'GAM_mgcv',
+              type = 's_smoother',
+              k = 4,
+              interaction.level = 0,
+              myFormula = NULL,
+              family = binomial(link = 'logit'),
+              method = 'GCV.Cp',
+              optimizer = c('outer','newton'),
+              select = FALSE,
+              knots = NULL,
+              paraPen = NULL,
+              control = list(
+                nthreads = 1, irls.reg = 0, epsilon = 1e-07
+                , maxit = 200, trace = FALSE
+                , mgcv.tol = 1e-07, mgcv.half = 15
+                , rank.tol = 1.49011611938477e-08
+                , nlm = list(ndigit=7, gradtol=1e-06, stepmax=2, 
+                steptol=1e-04, iterlim=200, check.analyticals=0)
+                , optim = list(factr=1e+07)
+                , newton = list(conv.tol=1e-06, maxNstep=5, maxSstep=2
+                , maxHalf=30, use.svd=0), outerPIsteps = 0
+                , idLinksBases = TRUE, scalePenalty = TRUE, keepData = FALSE) )
+  #, CTA = list(control = rpart.control(cp=0.005))
+  #, MAXENT.Phillips = list( path_to_maxent.jar = "F:/APPS/MAXENT/", memory_allocated = 4096)
+)
+
+# Set the models you want to use ----
+
+#Here I have set the models that are usually pretty quick to run
+models.to.proc = c('GLM', 'GAM')
+#models.to.proc = c('GAM','FDA','GLM','RF','CTA','ANN','MARS','GBM','MAXENT.Phillips')
+```
+
+
+##Run the models
+
+The datasplit is an important value in here.  75 (below) says that 75% of the data will be used to create (train) the model, the remain 25 is the used to evaulate the predictions based on that model VarImport = related to the way that biomod calculates the variable importance
+This is a variable randomisation method
+
+```{r}
+# Run the models ----
+myBiomodModelOut <- BIOMOD_Modeling(
+  data = myBiomodData,
+  models = models.to.proc,
+  models.options = myBiomodOption,
+  NbRunEval = 1,
+  DataSplit = 75,
+  Yweights = NULL,
+  VarImport = 5,
+  models.eval.meth = c('ROC', 'TSS'),
+  #models.eval.meth = c('ROC','TSS','FAR','KAPPA','SR','ACCURACY','BIAS','POD','CSI','ETS'),
+  SaveObj = TRUE,
+  rescal.all.models = TRUE
+)
+```
+
+```{r}
+ myBiomodModelOut
+    # get all models evaluation
+    myBiomodModelEval <- get_evaluations(myBiomodModelOut)
+    # print the dimnames of this array
+    dimnames(myBiomodModelEval)
+```
+
+##Evaluate models
+```{r}
+#evaluate models ----
+
+#performance scores for each model option
+myBiomodModelEval[,"Testing.data",,,]
+
+myBiomodModelEval["ROC","Sensitivity",,"Full",] #ablity to predict presences
+
+myBiomodModelEval["ROC","Specificity",,"Full",] #ability to predict absences
+
+#myBiomodModelEval["ROC",,,,]
+#[x,,,,] x= ROC or TSS
+#[,x,,,] x= Testing.Data, Cutoff, Sensitivity, Specificity
+#[,,x,,] x= GAM, FDA, etc
+#[,,,x,] x= RUN1, RUN2, etc., Full
+```
+
+###Variable importance
+
+```{r}
+#variable importance ----
+variable_important<-get_variables_importance(myBiomodModelOut)
+
+varImp_RUN1 <- data.frame(variable_important[,,"RUN1",]) %>% rownames_to_column(var = "name") %>% mutate(labelPos = 0.25)
+varImp_Full <- data.frame(variable_important[,,"Full",]) %>% rownames_to_column(var = "name") %>% mutate(labelPos = 0.5)
+
+variable_important <- 
+  bind_rows(RUN1 = varImp_RUN1, Full = varImp_Full, .id = "cv.rep") %>% 
+  full_join(y = selected_variables, by = "name") %>% 
+  mutate(expl.name = name) %>% 
+  identity()
+variable_important
+```
+
+###Graph variable response
+
+It's a good idea to look at how each variable responsed.  For example, what range of annual precipitation or temperature does the species like?  Not to0 cold, not too hot...  The below creates a graph for each predictor variable.  Look at the GLM or GAm plots as these tend to be more understandable. Think about whether what you are seeing makes ecological sense based on your understanding of the species
+
+
+```{r}
+selected_feature <- c("woodedge", "woodland", "broadleavedorcoppice", "conifer", "mixedornewwoods", "population", "building", "road", "woodpasture", "habitats", "terrain")
+selected_models <- c("GLM", "GAM")
+
+
+proj_dir<-paste0(getwd(),"/BIOMOD2_plots/")
+if (!file.exists(proj_dir))
+{
+  dir.create(file.path(proj_dir))
+}
+
+
+mod.plot<-BIOMOD_LoadModels(myBiomodModelOut, models=selected_models)
+
+selected_variables <- predictor_meta %>% 
+  filter(feature %in% selected_feature) %>% 
+  filter(name %in% get_formal_data(obj = myBiomodModelOut, 'expl.var.names'))
+
+# get 2D response plots data
+rp.dat <- 
+response.plot2(
+  models = mod.plot,
+  Data = get_formal_data(myBiomodModelOut, 'expl.var'),
+  show.variables = selected_variables$name,
+  data.species = get_formal_data(myBiomodModelOut,'resp.var'),
+  do.bivariate = F, 
+  fixed.var.metric = "median",
+  col = c("blue", "red"),
+  legend=FALSE, 
+  plot = FALSE
+  ) 
+
+#extract into a dataframe
+resp.plot.dat <- 
+  bind_rows(lapply(rp.dat, function(dat_){
+    dat_$id <- rownames(dat_)
+    expl.dat_ <- dat_ %>% select(1, id) %>% gather("expl.name", "expl.val", 1)
+    pred.dat_ <- dat_ %>% select(-1, id) %>% gather("pred.name", "pred.val", -id)
+    out.dat_ <- full_join(expl.dat_, pred.dat_) 
+    return(out.dat_)
+  })) %>% 
+  mutate(
+    species = pred.name %>% strsplit('_') %>%  sapply(function(x) x[1]) %>% stringr::str_remove(gsub("_", ".", exten)),
+    pa.dat = pred.name %>% strsplit('_') %>% sapply(function(x) x[2]),
+    cv.rep = pred.name %>% strsplit('_') %>% sapply(function(x) x[3]),
+    model = pred.name %>% strsplit('_') %>% sapply(function(x) x[4])
+  ) %>% 
+  left_join(y = selected_variables, by = c("expl.name" = "name")) %>% 
+  identity()
+
+```
+
+```{r}
+for(i in selected_models){
+
+gg <- ggplot(filter(resp.plot.dat, model == i), aes(x = expl.val, y = pred.val, col = cv.rep)) +
+  geom_line() +
+  geom_text(data = gather(variable_important, key = model, value = var.imp, GLM, GAM) %>% 
+              filter(model == i), 
+            aes(label = paste(cv.rep, "=", var.imp), 
+                x = 0, y = labelPos), 
+            hjust = "left", vjust = "center", size = 3) +
+  facet_wrap(~ feature+type+focal_radius, scales = 'free_x', labeller = labeller(.multi_line = F))+
+  labs(title = paste(i, "response plots for", species), 
+       subtitle = "by predictor (text shows variable importance for each run)")+
+  theme(legend.position = "none")
+print(gg)
+ggsave(paste0(proj_dir,project.name,"_", i ,"_var_plot.png"))
+}
+```
+
+
+
+
+
+
+
+
+
+
+
 
