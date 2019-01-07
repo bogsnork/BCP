@@ -2,6 +2,13 @@
 
 install.packages("skimr")
 install.packages("kableExtra")
+install.packages("corrr")
+install.packages("igraph")
+install.packages("ggraph")
+#ggraph requires the followign in linux terminal: 
+#sudo apt install libudunits2-dev
+install.packages("corrplot")
+
 
 install.packages("devtools")
 
